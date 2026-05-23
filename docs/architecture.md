@@ -16,10 +16,10 @@ That's it. Not a runtime. Not an orchestrator. Not a framework. Just a coordinat
 │ Remote (Hetzner)                                         │
 │                                                          │
 │   ┌────────────────────────────────────────────────┐     │
-│   │ crew server  (src/server.ilo)                  │     │
+│   │ crew server  (src/server.ilo, ilo httpd)       │     │
 │   │  - single writer                               │     │
 │   │  - authority for claims                        │     │
-│   │  - SSE broadcaster                             │     │
+│   │  - SSE snapshot of feed (file-read, not push)  │     │
 │   └─────┬──────────────────────┬───────────────────┘     │
 │         │                      │                         │
 │   ┌─────▼─────┐ ┌──────────────▼─────────────┐           │
@@ -98,14 +98,28 @@ Not chosen:
 - **tRPC** — TypeScript-specific; we're ilo
 - **Webhooks (as primary transport)** — wrong direction; agents are CLIs without public endpoints. Reserved for outbound notifications to Linear/Slack later
 
-For live push (server → subscribed agent) we'll add **SSE** on `GET /events/stream` when polling proves insufficient. Not v1.
+**SSE / live push.** The original design imagined `GET /events/stream` as an
+in-memory broadcaster: subscribers register a write callback, the server holds
+a list of them and fires on each new event. That model needs shared mutable
+state between requests, which `ilo httpd` does not have - every handler call is
+independent and all state lives on disk. It also needs a handler that can hold
+the connection open and emit lines as they arrive, which `ilo httpd` does not
+support: a chunked `L t` body is fully materialised before the first byte ships
+(see [blockers.md](blockers.md)).
+
+So the implemented `GET /events/stream` is a **file-tailing snapshot**: on each
+request the handler reads `data/feed/<today>.jsonl`, SSE-frames every line, and
+returns them as a chunked body, then closes. There is no held-open subscriber
+list and no ref/deref. For live freshness, crew-agent polls
+`GET /events?since=<ts>` against the on-disk feed. A true held-open tail is a
+follow-up that depends on httpd gaining a lazy/iterator response body.
 
 ## Endpoints (v1)
 
 ```
 POST   /events                      post a single event
 GET    /events?since=<ts>&kind=...  read events (polling)
-GET    /events/stream                SSE live push (deferred to v1.1)
+GET    /events/stream                SSE snapshot of today's feed (chunked, one-shot)
 
 GET    /memory                       list slugs
 GET    /memory/:slug                 read slug body + meta

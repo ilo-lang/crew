@@ -39,7 +39,8 @@ See [docs/architecture.md](docs/architecture.md) for the full picture, including
 
 ```sh
 # On the server box (one instance for the whole crew)
-ilo src/server.ilo
+export CREW_DATA_DIR=/srv/crew/data       # where the durable store lives
+ilo httpd src/server.ilo --port 7777
 
 # On each developer machine (one instance per machine)
 export CREW_SERVER=https://crew.example.com
@@ -57,9 +58,32 @@ crew is coordination infrastructure for AI agents. ilo is the programming langua
 
 ## Status
 
-v0. Scaffold + JSONL adapter + handler shapes laid out. Not yet wired end-to-end.
+v0.1. **Server side compiles and runs** against real ilo (`ilo httpd`). No Bun
+shim - ILO-46 / ILO-379 / ILO-448 (HTTP server, chunked streaming, stream
+consumers) and ILO-477 (`spawn`) have all shipped.
 
-**Blocked on [ILO-46](https://linear.app/ilo-lang/issue/ILO-46)** (HTTP server + streaming in ilo). See [docs/blockers.md](docs/blockers.md). Once ILO-46 lands the scaffold compiles as-written. Until then, a small Bun shim in [`shim/`](shim/) (TBD) bridges HTTP to ilo handlers so we can dogfood the design.
+Working today, verified end to end with `ilo httpd src/server.ilo`:
+
+- `src/server.ilo` - the HTTP handler. All routes serve: events post/list,
+  memory CRUD, claim acquire/free with conflict detection, artifacts,
+  `/events/stream` SSE snapshot, `/healthz`.
+- `src/types.ilo`, `src/store.ilo`, `src/store_jsonl.ilo` - the verified
+  modular JSONL store (the same logic is inlined into `server.ilo` because
+  `ilo httpd` does not yet resolve `use` imports - see blockers).
+- `src/store_sqlite.ilo`, `src/store_redis.ilo` - parse-clean stubs that error
+  loudly; `CREW_STORE=jsonl` is the only working backend.
+- `src/digest.ilo` - backup-cron scaffold; runs and reports its plan.
+
+Every server-side `.ilo` file passes `ilo check`.
+
+**Deferred:** `src/agent.ilo` / `src/cache.ilo` (the per-machine daemon) pend
+an open process-model question - `ilo httpd` owns the foreground process, so
+the agent's background SSE/queue loops may need a second process or careful
+`spawn` interplay. See [docs/blockers.md](docs/blockers.md).
+
+**Known gap:** `/events/stream` is a one-shot file-tailing snapshot, not a
+held-open live tail, because httpd buffers chunked bodies before sending. See
+[docs/blockers.md](docs/blockers.md).
 
 See [docs/architecture.md](docs/architecture.md) for the design, and [src/](src/) for what's built.
 

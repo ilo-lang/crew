@@ -1,37 +1,70 @@
 # Blockers
 
-Things crew needs from ilo that don't exist yet.
+Things crew needs from ilo. Most of the original blockers have shipped; this
+file now tracks what's left plus a couple of gaps the server rewrite surfaced.
 
-## ILO-46 — HTTP streaming + `ilo httpd` server subcommand
+## Shipped (no longer blocking)
 
-**Status:** roadmap placeholder upstream. Tracked at <https://linear.app/ilo-lang/issue/ILO-46>. ilo docs: [`docs/streaming.md`](https://github.com/ilo-lang/ilo/blob/main/docs/streaming.md).
+### ILO-46 / ILO-379 / ILO-448 — HTTP server + streaming
 
-**What crew needs that ILO-46 ships:**
+**Status: shipped.** `ilo httpd <handler.ilo> --port N` serves a `handler`
+function over HTTP/1.1, with chunked transfer-encoding for `L t` response
+bodies (ILO-379). Client-side lazy stream consumers (`get-stream`,
+`pst-stream`) shipped under ILO-448. ilo docs:
+[`docs/streaming.md`](https://github.com/ilo-lang/ilo/blob/main/docs/streaming.md).
 
-- `ilo httpd <handler.ilo> --port N` with `fn handle (req:Request) > Response`
-  - `crew-server` and `crew-agent` are both HTTP servers. Without this, ilo can't serve HTTP at all.
-- `get-stream url > L t` (lazy SSE iterator, `@chunk stream {...}`)
-  - `crew-agent` subscribes to `crew-server`'s `/events/stream` to keep the local mirror fresh.
-- `get-stream-h`, `pst-stream`, `pst-stream-h` for custom headers + streaming POST.
-  - We need bearer-token auth on the SSE subscription.
+The server side of crew now compiles and runs against this directly - no Bun
+shim. `src/server.ilo` is the live handler; run it with
+`ilo httpd src/server.ilo --port 7777`.
 
-**Crew's relationship to ILO-46:** crew is the load-bearing dogfood case. Every day ILO-46 isn't merged is a day crew runs through a shim instead of through ilo end-to-end. Use crew as motivation to prioritise the ticket.
+### spawn — background loops (ILO-477)
 
-**Workaround until ILO-46 lands:** [`shim/`](../shim/) (TBD) — a thin Bun HTTP server that hands each request to an ilo handler via stdin/stdout. Deleted the day ILO-46 merges.
+**Status: shipped.** `spawn fn args > _` fires a fire-and-forget background
+OS thread. This unblocks the daemon-style concurrency crew-agent needs (HTTP
+server + SSE consumer + queue drainer in one process). The server side does
+not use it; only crew-agent will.
 
-## Concurrency primitives (no tracking issue yet)
+## Open gaps surfaced by the server rewrite
 
-**What's missing:** ilo has no `spawn`, no green threads, no async runtime. `par-map` exists for parallel fan-out over a fixed list but not for long-lived background loops.
+### `ilo httpd` does not resolve `use` imports
 
-**Why crew needs this:** `crew-agent` runs three loops concurrently:
-1. MCP HTTP server (foreground)
-2. SSE consumer (background, long-lived)
-3. Write-behind queue drainer (background, ticker)
+`ilo httpd` lexes/parses/verifies only the single handler file. Unlike
+`ilo run` and `ilo check`, it never calls the import-resolution pass, so a
+handler that does `use "store_jsonl.ilo"` fails at startup with
+`undefined function`. Consequence: `src/server.ilo` has to be self-contained,
+so the type + jsonl-store logic is inlined there (it also lives, verified, in
+the modular `types.ilo` / `store_jsonl.ilo` for `ilo check` and the
+`ilo run`-based tooling). Keep the two in sync until httpd learns imports.
+Worth filing upstream.
 
-**Current workaround:** structure the daemon as a single-threaded event loop where the HTTP server polls the queue between requests and the SSE connection is interleaved. Workable but ugly. Worth filing as a follow-up to ILO-46.
+### Streaming responses are buffered, not handler-driven
+
+`ilo httpd` accepts an `L t` body and frames it as chunked transfer-encoding,
+but it materialises the whole list before writing the first byte (the List arm
+in `handle_http_connection` does `items.iter().map(to_string).collect()`). So
+a handler cannot hold the connection open and emit feed lines as they are
+appended. `GET /events/stream` therefore returns a one-shot SSE *snapshot* of
+today's feed, correctly chunk-framed, then closes - it is not a live tail.
+
+A true file-tailing SSE stream needs httpd to accept a lazy `L t` (or a pull
+callback) for the response body. Until then, crew-agent should poll
+`/events?since=<ts>` rather than rely on a held-open `/events/stream`.
+
+### crew-agent process model is unresolved
+
+`ilo httpd` owns the process (it runs the accept loop and blocks). crew-agent
+needs an MCP HTTP server *plus* a background SSE consumer / queue drainer.
+With `spawn` we can launch background loops, but `ilo httpd`'s own loop is the
+foreground - so either crew-agent runs httpd and spawns the loops as threads
+(unverified that spawn co-exists cleanly with the httpd accept loop), or it
+runs as a second process alongside httpd. This is the open question that
+defers `src/agent.ilo` / `src/cache.ilo` to a separate task.
 
 ## TCP / RESP client (no tracking issue yet)
 
-**What's missing:** ilo has HTTP client builtins but no raw TCP socket. Blocks the Redis storage adapter.
+**What's missing:** ilo has HTTP client builtins but no raw TCP socket. Blocks
+the Redis storage adapter (`src/store_redis.ilo` errors loudly until then).
 
-**Crew's impact:** small for v1 — the JSONL adapter is fine. If/when contention or pubsub demands push us toward Redis, we'll either add a TCP client to ilo or shell out to `redis-cli` via `run`.
+**Crew's impact:** small for v1 - the JSONL adapter is fine. If contention or
+pubsub demands push us toward Redis, we'll either add a TCP client to ilo or
+shell out to `redis-cli` via `run`.
