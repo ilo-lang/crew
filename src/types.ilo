@@ -1,38 +1,14 @@
 -- crew shared types
 --
--- Event:    one entry in the activity feed.
--- Memory:   a slug-addressed note that future sessions read.
--- Claim:    an exclusive hold on a target (ticket id, file path, etc).
--- Artifact: a pointer to research/repro/benchmark output for a target.
+-- event:    one entry in the activity feed.
+-- memory:   a slug-addressed note that future sessions read.
+-- claim:    an exclusive hold on a target (ticket id, file path, etc).
+-- artifact: a pointer to research/repro/benchmark output for a target.
 
-type Event = {
-  evid:t,        -- unique event id (machine-uuid)
-  ts:n,          -- unix ms
-  machine:t,     -- e.g. "dan-laptop"
-  agent:t,       -- e.g. "claude-code-opus"
-  kind:t,        -- claim-ticket | claim-pr | open-pr | update | blocked | artifact | merged-pr | closed-ticket
-  target:t,      -- "ILO-42", "PR#123", "file:src/foo.rs"
-  note:t,        -- free text
-  meta:M t t     -- optional structured payload
-}
+type event{evid:t;ts:n;machine:t;agent:t;kind:t;target:t;note:t}
 
-type Memory = {
-  slug:t,
-  body:t,        -- markdown content, including any frontmatter
-  updated:n      -- unix ms, server-stamped
-}
+type memory{slug:t;body:t;updated:n}
 
-type Claim = {
-  target:t,
-  holder:t,      -- "machine:agent" of the holder
-  ts:n           -- unix ms acquired
-}
+type claim{target:t;holder:t;ts:n}
 
-type Artifact = {
-  target:t,
-  kind:t,        -- research | repro | benchmark | diagram | decision-doc
-  link:t,        -- url or path
-  ts:n,
-  machine:t,
-  agent:t
-}
+type artifact{target:t;kind:t;link:t;ts:n;machine:t;agent:t}

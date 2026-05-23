@@ -1,36 +1,23 @@
--- crew Store adapter contract.
+-- crew store contract.
 --
--- Each backend (jsonl, sqlite, redis) exports a make_store(cfg) function
--- returning a Store record with these handlers. The server selects one
--- at startup via CREW_STORE env.
+-- v1 uses flat top-level functions per backend rather than a record of
+-- closures: ilo records cannot hold function-typed fields (the `F a>b`
+-- type is rejected inside a `type` decl, verified against ilo 26.5.0), so
+-- the closure-dispatch table the original design sketched does not
+-- compile. server.ilo therefore calls the jsonl-* functions in
+-- store-jsonl.ilo directly. Adapter switching by CREW_STORE is a
+-- follow-up once a dispatch mechanism that compiles is in place.
+--
+-- This module exposes `store-backend`, which reports the configured
+-- backend name so server.ilo can refuse to start on an unimplemented one.
 
-use types
+backend-name>t;
+  default-on-err (env "CREW_STORE") "jsonl"
 
-type Store = {
-  -- feed
-  feed_append: (Event) -> R _ t,
-  feed_since:  (n) -> L Event,
-
-  -- memory
-  memory_get:  (t) -> R Memory t,
-  memory_put:  (t, t) -> R Memory t,
-  memory_del:  (t) -> R _ t,
-  memory_list: () -> L t,
-
-  -- claims (authoritative — the server owns these)
-  claim_try:   (t, t) -> R Claim t,   -- target, holder
-  claim_free:  (t, t) -> R _ t,        -- target, holder
-  claim_list:  () -> L Claim,
-
-  -- artifacts
-  artifact_add:  (t, t, t, t, t) -> R Artifact t,   -- target, kind, link, machine, agent
-  artifact_list: (t) -> L Artifact                  -- target
-}
-
--- Adapter selection. CREW_STORE chooses; default is jsonl.
-make_store cfg:M t t>R Store t;
-  backend=mget cfg "store" "jsonl";
-  if (= backend "jsonl") {ret (make_store_jsonl cfg)};
-  if (= backend "sqlite") {ret (make_store_sqlite cfg)};
-  if (= backend "redis") {ret (make_store_redis cfg)};
-  ^+"unknown CREW_STORE: " backend
+-- Returns the backend name if supported, else an Err naming the backend.
+store-backend>R t t;
+  b=backend-name
+  =b "jsonl" ~b
+  =b "sqlite" ^+"sqlite backend not implemented yet: " b
+  =b "redis" ^+"redis backend not implemented yet: " b
+  ^+"unknown CREW_STORE: " b
