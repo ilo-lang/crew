@@ -103,7 +103,7 @@ Launch a background `Agent` with `run_in_background: true`, `subagent_type: gene
 - The exact design decision for this ticket (you have to think this through — never tell the subagent "pick an approach"; pick it yourself).
 - Worktree path + `CARGO_TARGET_DIR=/home/<user>/.cache/cargo-target-<num>`.
 - "Do NOT edit ai.txt — it's auto-generated from SPEC.md by build.rs."
-- "After tests pass: push, `gh pr create`, remove `mini` label from Linear and PR, do NOT add `mini-reviewing`."
+- "After tests pass: push, `gh pr create`, remove `mini` label from Linear and PR, **move the Linear ticket from `In Progress` to `In Review`** (resolve state ids by name via `workflowStates`; the state change is what signals the PR is up — leaving it at `In Progress` makes the board look stuck), do NOT add `mini-reviewing` (that label is for reviewing *other* PRs, not for our fix-in-flight)."
 - "If you hit a blocker, stop and report — don't paper over."
 
 ## 4. Fallback: no fix work available
