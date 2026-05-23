@@ -1,14 +1,25 @@
--- SQLite-backed Store adapter. Stub for v1 — wired into the contract
--- but the body shells out to sqlite3 (no native ilo SQLite bindings yet).
+-- sqlite-backed store adapter. Stub for v1.
 --
--- Schema (see scripts/sqlite/schema.sql when implemented):
---   events     (evid TEXT PRIMARY KEY, ts INTEGER, machine, agent, kind, target, note, meta)
+-- Planned: shell out to the sqlite3 CLI via `run` (ilo has no native
+-- SQLite bindings). Schema sketch:
+--   events     (evid TEXT PRIMARY KEY, ts INTEGER, machine, agent, kind, target, note)
 --   memory     (slug TEXT PRIMARY KEY, body TEXT, updated INTEGER)
 --   claims     (target TEXT PRIMARY KEY, holder TEXT, ts INTEGER)
 --   artifacts  (rowid INTEGER PK, target, kind, link, ts, machine, agent)
+--
+-- Until then every entry point errors loudly. CREW_STORE=jsonl is the
+-- only working backend in v1.
 
-use types
-use store
+use "types.ilo"
 
-make_store_sqlite cfg:M t t>R Store t;
-  ^"sqlite adapter not implemented yet — use CREW_STORE=jsonl for v1"
+sqlite-feed-append ev:event>R event t;
+  ^"sqlite backend not implemented yet - set CREW_STORE=jsonl"
+
+sqlite-memory-get slug:t>R memory t;
+  ^"sqlite backend not implemented yet - set CREW_STORE=jsonl"
+
+sqlite-claim-try target:t holder:t>R claim t;
+  ^"sqlite backend not implemented yet - set CREW_STORE=jsonl"
+
+sqlite-artifact-add target:t kind:t link:t machine:t agent:t>R artifact t;
+  ^"sqlite backend not implemented yet - set CREW_STORE=jsonl"

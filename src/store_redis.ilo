@@ -1,15 +1,24 @@
--- Redis-backed Store adapter. Stub for v1.
+-- redis-backed store adapter. Stub for v1.
 --
--- Blocker: ilo has no RESP/TCP client today. Implementing this is the
--- first big "ilo can't" entry to log in ilo_assessment_feedback.md
--- when we get to it. Two paths forward:
---   1. Add a RESP client builtin / package to ilo (manifesto-loop way)
---   2. Shell out to redis-cli via run (works, not idiomatic)
+-- Blocker: ilo has no RESP/TCP client today. Two paths forward when we
+-- pick this up:
+--   1. add a RESP client builtin / package to ilo (manifesto-loop way)
+--   2. shell out to redis-cli via `run` (works, not idiomatic)
 --
--- Until either lands, this adapter errors loudly.
+-- Until either lands, every entry point errors loudly. This is the first
+-- big "ilo can't" entry to log in ilo_assessment_feedback.md when we get
+-- to it. CREW_STORE=jsonl is the only working backend in v1.
 
-use types
-use store
+use "types.ilo"
 
-make_store_redis cfg:M t t>R Store t;
-  ^"redis adapter blocked — ilo has no RESP client. See store_redis.ilo."
+redis-feed-append ev:event>R event t;
+  ^"redis backend blocked - ilo has no RESP client. set CREW_STORE=jsonl"
+
+redis-memory-get slug:t>R memory t;
+  ^"redis backend blocked - ilo has no RESP client. set CREW_STORE=jsonl"
+
+redis-claim-try target:t holder:t>R claim t;
+  ^"redis backend blocked - ilo has no RESP client. set CREW_STORE=jsonl"
+
+redis-artifact-add target:t kind:t link:t machine:t agent:t>R artifact t;
+  ^"redis backend blocked - ilo has no RESP client. set CREW_STORE=jsonl"

@@ -1,15 +1,23 @@
--- Digest cron. Runs on the server box on a schedule (DIGEST_CRON env or
--- driven by systemd-timer). Rsyncs data/ into a separate backup git
--- repo, commits, pushes.
+-- digest cron. Runs on the server box on a schedule (systemd-timer or a
+-- DIGEST_CRON entry). Mirrors the data dir into a separate backup git repo,
+-- commits, and pushes.
 --
--- v1 status: scaffold. Real implementation lands once we have the
--- backup repo set up + a GitHub App for auth (see docs/architecture.md
--- "Backup" section).
+-- v1 status: scaffold. Real implementation lands once the backup repo and
+-- a GitHub App for auth are set up (see docs/architecture.md "Backup").
+--
+-- Run with:  ilo run src/digest.ilo
 
-main argv:L t>_;
-  src=env "DATA_DIR" "./data";
-  backup_repo=env "BACKUP_REPO" "";
-  if (= backup_repo "") {prnt "BACKUP_REPO not set; skipping digest."; ret _};
-  ts=dtfmt (now-ms) "%Y-%m-%dT%H:%M:%SZ";
-  -- TODO: clone if missing, rsync src into clone, git add -A, commit "digest <ts>", push.
-  prnt (fmt "digest stub: would mirror {} to {} at {}" src backup_repo ts)
+now-stamp>t;
+  default-on-err (dtfmt (/(now-ms) 1000) "%Y-%m-%dT%H:%M:%SZ") "unknown"
+
+main args:L t>_;
+  src=default-on-err (env "CREW_DATA_DIR") "./data"
+  backup=default-on-err (env "BACKUP_REPO") ""
+  prnt (plan-line src backup)
+
+-- Message describing what this run would do. Empty BACKUP_REPO is a no-op.
+-- TODO: when implemented - clone if missing, rsync src into clone,
+--       git add -A, git commit "digest <ts>", git push.
+plan-line src:t backup:t>t;
+  =backup "" "BACKUP_REPO not set; skipping digest."
+  fmt "digest stub: would mirror {} to {} at {}" src backup (now-stamp)
