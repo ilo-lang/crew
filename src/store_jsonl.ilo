@@ -1,124 +1,177 @@
--- JSONL/file-backed Store adapter. Default backend.
+-- jsonl/file-backed store adapter. Default backend.
 --
--- Layout under data/:
---   feed/YYYY-MM-DD.jsonl    one line per event, append-only
+-- Layout under the data dir (CREW_DATA_DIR, default ./data):
+--   feed/YYYY-MM-DD.jsonl     one line per event, append-only
 --   memory/<slug>.md          last-writer-wins per slug
 --   claims/<target>.json      one file per active claim (presence = held)
 --   artifacts/<target>.jsonl  append-only per target
 --
--- Only the server runs this. Single writer per process. No flock needed.
+-- Only the server runs this. Single writer per process, no flock needed.
+-- Flat functions, called directly from server.ilo (see store.ilo for why
+-- the record-of-closures adapter shape was dropped for v1).
 
-use types
-use store
+use "types.ilo"
 
--- ---------- helpers ----------
+-- ---------- typed json parsers ----------
+-- jpar returns `_`; route through typed helpers so the verifier knows the
+-- record shape for field access. A parse failure yields an empty record
+-- rather than propagating, since these run inside map lambdas that cannot
+-- carry a Result.
 
-feed_path dir:t ts:n>t;
-  day=dtfmt ts "%Y-%m-%d";
-  pathjoin dir (+ "feed/" + day ".jsonl")
+empty-event>event;
+  event evid:"" ts:0 machine:"" agent:"" kind:"" target:"" note:""
 
-memory_path dir:t slug:t>t;
-  pathjoin dir (+ "memory/" + slug ".md")
+empty-claim>claim;
+  claim target:"" holder:"" ts:0
 
-claim_path dir:t target:t>t;
-  pathjoin dir (+ "claims/" + (slugify target) ".json")
+empty-memory>memory;
+  memory slug:"" body:"" updated:0
 
-artifact_path dir:t target:t>t;
-  pathjoin dir (+ "artifacts/" + (slugify target) ".jsonl")
+empty-artifact>artifact;
+  artifact target:"" kind:"" link:"" ts:0 machine:"" agent:""
+
+parse-event s:t>event;
+  default-on-err (jpar s) (empty-event)
+
+parse-claim s:t>claim;
+  default-on-err (jpar s) (empty-claim)
+
+parse-artifact s:t>artifact;
+  default-on-err (jpar s) (empty-artifact)
+
+-- ---------- paths ----------
+
+data-dir>t;
+  default-on-err (env "CREW_DATA_DIR") "./data"
+
+-- timestamps are stored as unix ms; dtfmt wants seconds.
+day-of ts:n>t;
+  default-on-err (dtfmt (/ts 1000) "%Y-%m-%d") "1970-01-01"
 
 slugify s:t>t;
-  -- replace anything that isn't [a-zA-Z0-9_-] with "_"
-  rgx-replace s "[^a-zA-Z0-9_-]" "_"
+  rgxsub "[^a-zA-Z0-9_-]" "_" s
 
--- ---------- handlers ----------
+feed-path dir:t ts:n>t;
+  fname=+(day-of ts)".jsonl"
+  pathjoin [dir "feed" fname]
 
-jsonl_feed_append dir:t e:Event>R _ t;
-  fp=feed_path dir e.ts;
-  line=+ (jdmp e) "\n";
-  wr-append fp line
+memory-path dir:t slug:t>t;
+  fname=+slug".md"
+  pathjoin [dir "memory" fname]
 
-jsonl_feed_since dir:t since:n>L Event;
-  -- naive v0: scan today's + yesterday's files, filter by ts.
-  -- TODO(perf): once we have heavy reads, index by day.
-  today=dtfmt (now-ms) "%Y-%m-%d";
-  yday=dtfmt (- (now-ms) 86400000) "%Y-%m-%d";
-  paths=[pathjoin dir (+ "feed/" yday ".jsonl") pathjoin dir (+ "feed/" today ".jsonl")];
-  lines=flatmap (p:t>L t;if (isfile p) {rdjl p} else {[]}) paths;
-  events=map jpar lines;
-  flt (e:Event>bool;> e.ts since) events
+claim-path dir:t target:t>t;
+  fname=+(slugify target)".json"
+  pathjoin [dir "claims" fname]
 
-jsonl_memory_get dir:t slug:t>R Memory t;
-  fp=memory_path dir slug;
-  if (! isfile fp) {^+"slug not found: " slug};
-  body=rd fp;
-  upd=mtime fp;
-  ~slug:slug body:body updated:upd
+artifact-path dir:t target:t>t;
+  fname=+(slugify target)".jsonl"
+  pathjoin [dir "artifacts" fname]
 
-jsonl_memory_put dir:t slug:t body:t>R Memory t;
-  fp=memory_path dir slug;
-  wr fp body;
-  ~slug:slug body:body updated:(now-ms)
+-- ---------- setup ----------
+-- ilo has no native mkdir; shell out once. run only Errs on spawn failure
+-- (non-zero exit is Ok), so default-on-err is enough.
 
-jsonl_memory_del dir:t slug:t>R _ t;
-  fp=memory_path dir slug;
-  if (isfile fp) {rm fp};
-  ~_
+ensure-dirs dir:t>t;
+  default-on-err (run "mkdir" ["-p" pathjoin [dir "feed"]]) (mmap)
+  default-on-err (run "mkdir" ["-p" pathjoin [dir "memory"]]) (mmap)
+  default-on-err (run "mkdir" ["-p" pathjoin [dir "claims"]]) (mmap)
+  default-on-err (run "mkdir" ["-p" pathjoin [dir "artifacts"]]) (mmap)
+  dir
 
-jsonl_memory_list dir:t>L t;
-  glob (pathjoin dir "memory/*.md") | map basename | map (s:t>t;rgx-replace s "\\.md$" "")
+-- ---------- feed ----------
 
-jsonl_claim_try dir:t target:t holder:t>R Claim t;
-  fp=claim_path dir target;
-  if (isfile fp) {
-    existing=jpar (rd fp);
-    if (= existing.holder holder) {ret ~existing};
-    ^+"already claimed by " existing.holder
-  };
-  c=~target:target holder:holder ts:(now-ms);
-  wr fp (jdmp c);
+jsonl-feed-append ev:event>R event t;
+  dir=ensure-dirs (data-dir())
+  fp=feed-path dir ev.ts
+  line=+(jdmp ev)"\n"
+  wra fp line
+  ~ev
+
+-- Naive v0: scan today's and yesterday's files, filter by ts. Once reads
+-- get heavy, index by day. Returns events strictly newer than `since`.
+jsonl-feed-since since:n>L event;
+  dir=data-dir()
+  paths=[feed-path dir (now-ms) feed-path dir -(now-ms)86400000]
+  lines=flatmap (p:t>L t;?h (isfile p) (default-on-err (rdl p) []) []) paths
+  events=map (ln:t>event;parse-event ln) lines
+  flt (ev:event>b;>ev.ts since) events
+
+-- Today's raw feed lines, oldest-first (used by the SSE snapshot route).
+jsonl-feed-today-lines>L t;
+  fp=feed-path (data-dir()) (now-ms)
+  ?h (isfile fp) (default-on-err (rdl fp) []) []
+
+-- ---------- memory ----------
+
+jsonl-memory-get slug:t>R memory t;
+  fp=memory-path (data-dir()) slug
+  =(isfile fp) false ^+"slug not found: "slug
+  body=rd! fp
+  upd=default-on-err (mtime fp) 0
+  ~memory slug:slug body:body updated:upd
+
+jsonl-memory-put slug:t body:t>R memory t;
+  dir=ensure-dirs (data-dir())
+  fp=memory-path dir slug
+  wr fp body
+  ~memory slug:slug body:body updated:(now-ms)
+
+jsonl-memory-del slug:t>R t t;
+  fp=memory-path (data-dir()) slug
+  (isfile fp){default-on-err (run "rm" [fp]) (mmap)}
+  ~slug
+
+jsonl-memory-list>L t;
+  files=default-on-err (glob (pathjoin [data-dir() "memory"]) "*.md") []
+  map (p:t>t;rgxsub "\\.md$" "" (basename p)) files
+
+-- ---------- claims ----------
+
+-- Held by the same holder is idempotent-Ok; held by another is an Err.
+held-result held:claim hldr:t>R claim t;
+  =held.holder hldr ~held
+  ^+"already claimed by "held.holder
+
+jsonl-claim-try target:t holder:t>R claim t;
+  dir=ensure-dirs (data-dir())
+  fp=claim-path dir target
+  (isfile fp){ret held-result (parse-claim (rd! fp)) holder}
+  c=claim target:target holder:holder ts:(now-ms)
+  wr fp (jdmp c)
   ~c
 
-jsonl_claim_free dir:t target:t holder:t>R _ t;
-  fp=claim_path dir target;
-  if (! isfile fp) {ret ~_};
-  existing=jpar (rd fp);
-  if (! = existing.holder holder) {^+"claim held by " existing.holder};
-  rm fp;
-  ~_
+-- Delete the claim file iff held by `hldr`, else Err without touching it.
+free-if-owner held:claim hldr:t fp:t target:t>R t t;
+  =held.holder hldr {default-on-err (run "rm" [fp]) (mmap);ret ~target}
+  ^+"claim held by "held.holder
 
-jsonl_claim_list dir:t>L Claim;
-  paths=glob (pathjoin dir "claims/*.json");
-  map (p:t>Claim;jpar (rd p)) paths
+jsonl-claim-free target:t holder:t>R t t;
+  fp=claim-path (data-dir()) target
+  =(isfile fp) false ~target
+  free-if-owner (parse-claim (rd! fp)) holder fp target
 
-jsonl_artifact_add dir:t target:t kind:t link:t machine:t agent:t>R Artifact t;
-  a=~target:target kind:kind link:link ts:(now-ms) machine:machine agent:agent;
-  fp=artifact_path dir target;
-  wr-append fp (+ (jdmp a) "\n");
+-- glob returns names relative to its dir arg, so rejoin before reading.
+read-claim-file cdir:t name:t>claim;
+  fp=pathjoin [cdir name]
+  parse-claim (default-on-err (rd fp) "{}")
+
+jsonl-claim-list>L claim;
+  cdir=pathjoin [data-dir() "claims"]
+  names=default-on-err (glob cdir "*.json") []
+  map (n:t>claim;read-claim-file cdir n) names
+
+-- ---------- artifacts ----------
+
+jsonl-artifact-add target:t kind:t link:t machine:t agent:t>R artifact t;
+  dir=ensure-dirs (data-dir())
+  a=artifact target:target kind:kind link:link ts:(now-ms) machine:machine agent:agent
+  fp=artifact-path dir target
+  line=+(jdmp a)"\n"
+  wra fp line
   ~a
 
-jsonl_artifact_list dir:t target:t>L Artifact;
-  fp=artifact_path dir target;
-  if (! isfile fp) {ret []};
-  map jpar (rdjl fp)
-
--- ---------- constructor ----------
-
-make_store_jsonl cfg:M t t>R Store t;
-  dir=mget cfg "data_dir" "./data";
-  -- ensure dirs exist
-  mkdir-p (pathjoin dir "feed");
-  mkdir-p (pathjoin dir "memory");
-  mkdir-p (pathjoin dir "claims");
-  mkdir-p (pathjoin dir "artifacts");
-  ~Store
-    feed_append:(e:Event>R _ t;jsonl_feed_append dir e)
-    feed_since:(s:n>L Event;jsonl_feed_since dir s)
-    memory_get:(g:t>R Memory t;jsonl_memory_get dir g)
-    memory_put:(s:t b:t>R Memory t;jsonl_memory_put dir s b)
-    memory_del:(s:t>R _ t;jsonl_memory_del dir s)
-    memory_list:(>L t;jsonl_memory_list dir)
-    claim_try:(tg:t h:t>R Claim t;jsonl_claim_try dir tg h)
-    claim_free:(tg:t h:t>R _ t;jsonl_claim_free dir tg h)
-    claim_list:(>L Claim;jsonl_claim_list dir)
-    artifact_add:(tg:t k:t l:t m:t a:t>R Artifact t;jsonl_artifact_add dir tg k l m a)
-    artifact_list:(tg:t>L Artifact;jsonl_artifact_list dir tg)
+jsonl-artifact-list target:t>L artifact;
+  fp=artifact-path (data-dir()) target
+  =(isfile fp) false []
+  lines=default-on-err (rdl fp) []
+  map (ln:t>artifact;parse-artifact ln) lines
