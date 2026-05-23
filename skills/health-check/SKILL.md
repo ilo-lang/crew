@@ -44,11 +44,17 @@ Use `TaskList` to see every active subagent. For each one that is `running`:
 
 For each agent in `TaskList` that is `completed` or `failed`:
 
-- If `failed` or closed without a PR URL → relaunch via `Agent` with the same ticket. Point the new agent at the existing worktree path (state should still be on disk). Tell it: `previous run closed without a PR. Pick up from current worktree state at /home/<user>/ilo-<num>. Don't restart from scratch.`
+- If `failed` or closed without a PR URL → **before** relaunching, capture the failure reason from the agent's last message and file a Linear ticket if it surfaced a new problem (see step 5). Then relaunch via `Agent` with the same ticket. Point the new agent at the existing worktree path (state should still be on disk). Tell it: `previous run closed without a PR. Pick up from current worktree state at /home/<user>/ilo-<num>. Don't restart from scratch.`
 - If `completed` with a PR URL:
   1. Confirm the PR exists and CI is at least pending: `gh pr view <num> --json statusCheckRollup,labels`.
   2. Re-check that the Linear `mini` label was removed — if it sneaked back, remove again.
-  3. Clean up: `git worktree remove --force /home/<user>/ilo-<num>; rm -rf /home/<user>/.cache/cargo-target-<num> /tmp/target-<num>`.
+  3. **Automatic cleanup (always run, no exceptions):**
+     ```
+     git -C /home/<user>/ilo worktree remove --force /home/<user>/ilo-<num>
+     rm -rf /home/<user>/.cache/cargo-target-<num> /tmp/target-<num>
+     ```
+     Run these unconditionally when the subagent finishes — whether the PR was opened, the run failed, or the agent self-stopped on a blocker. Stale worktrees and cargo target dirs are the single biggest source of disk-quota failures in the pipeline; never leave them behind.
+  4. Scan the agent's final report for any newly-discovered language bug, regression, or block that isn't already tracked → file as a Linear ticket per step 5 before the next pass.
 
 ## 3. Top up to two-in-flight
 
@@ -127,28 +133,40 @@ iv. **If something fails:**
 - Release the review claim (`mini-reviewing` off Linear, GitHub PR).
 - File a Linear ticket (see step 5) if the failure looks like infra or systemic regression.
 
-## 5. File issues as you go
+## 5. File issues as you go (automatic — never optional)
 
-Any problem the pass discovers that isn't already tracked → file a Linear ticket immediately so the next pass can act on it. Examples:
+**Every** new problem, regression, or block the pass discovers must become a Linear ticket before the pass ends. This is the canonical recovery mechanism — anything not on the board is lost. Skipping this step is a P0 violation of the loop.
 
-- A subagent reported a real language bug while doing a different ticket → new ticket on the new bug.
-- CI infra failing for everyone (codecov offline, runners down) → new ticket, label `infra`.
-- A PR can't be merged because of a missing review from a specific reviewer → new ticket linking the PR.
+Auto-file a ticket when any of these happen in the pass:
+
+- A subagent's final report mentions a language bug or regression unrelated to its ticket → new ticket capturing the symptom, repro shape, and where the agent encountered it.
+- A subagent stopped on a real blocker (acceptance criteria unreachable without product input, design decision required, dependency missing) → new ticket re-scoped around the blocker; close-link the original ticket to it.
+- A subagent failed with an infra / harness error (cargo target dir full, git lock, gh token expired, network timeout) → new ticket labelled `infra`; do NOT re-claim the original ticket until the infra ticket has a fix.
+- CI infra failing for everyone (codecov offline, runners down) → new ticket labelled `infra`.
+- A PR is unmergeable because of a missing required review → new ticket linking the PR.
 - A worktree on disk doesn't match any Linear issue (orphan) → new chore ticket to investigate.
+- A previously-merged PR introduced a regression discovered while reviewing a later PR → new ticket linked to both PRs, flagged with the regressing commit hash.
 
-Create with:
+**De-dup first.** Search for an open ticket with the same symptom signature before creating one (`issues(filter:{title:{containsIgnoreCase:"<signature>"}, state:{type:{neq:"completed"}}})`); if one exists, comment on it instead of opening a duplicate.
+
+**Create with:**
 ```graphql
 mutation {
   issueCreate(input:{
-    title:"<short>",
-    description:"<context including ticket / PR links and what was observed>",
+    title:"<short symptom-led title>",
+    description:"<context including ticket / PR links, exact error, repro shape, what was being attempted when discovered>",
     teamId:"<teamId>",
-    priority: <0..4>
+    priority: <0..4>,
+    labelIds:[<one or more of: bug, infra, regression, block, chore>]
   }){ success issue{ identifier url } }
 }
 ```
 
-Never silently swallow a problem.
+Resolve label ids by name; never hard-code. If a label doesn't exist yet, create it (`issueLabelCreate`) and proceed.
+
+**Always quote-link to the discovering ticket / PR** in the new ticket's description so the next pass can trace the chain backward.
+
+Never silently swallow a problem. If you don't have the context to write a good title, file the ticket with the shortest accurate description and a `triage` label rather than dropping it.
 
 ## 6. Report
 
