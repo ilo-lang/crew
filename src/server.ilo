@@ -1,129 +1,352 @@
 -- crew server: single-writer authority for the durable store.
 --
--- Responsibilities:
---   - REST endpoints (see docs/architecture.md)
---   - SSE broadcast on /events/stream so per-machine agents stay live
---   - Claim acquisition is the only synchronous-must-succeed path
---   - Everything else is post-and-return; clients read back via SSE
+-- Run with:  ilo httpd src/server.ilo --port 7777
+-- `ilo httpd` owns the process, parses each request into a Request record
+-- (fields method:t path:t headers:M t t body:t) and calls `handler`.
 --
--- v1 status: scaffold. Routes laid out, handlers delegate to Store.
--- HTTP server primitive is the open question — ilo's http-listen surface
--- is the next thing to confirm. See ilo_assessment_feedback.md.
+-- Routes:
+--   POST   /events            append an event
+--   GET    /events?since=N     events newer than N (ms)
+--   GET    /events/stream      SSE snapshot of today's feed (see note below)
+--   GET    /memory             list memory slugs
+--   GET    /memory/<slug>      read a memory note
+--   PUT    /memory/<slug>      write a memory note (body = content)
+--   DELETE /memory/<slug>      delete a memory note
+--   GET    /claims             list active claims
+--   POST   /claims/<target>    try to acquire a claim (body: {"holder":...})
+--   DELETE /claims/<target>    release a claim (body: {"holder":...})
+--   POST   /artifacts          add an artifact (json body)
+--   GET    /artifacts?target=  list artifacts for a target
+--   GET    /healthz            liveness
+--
+-- There is no shared mutable state between requests: every handler call is
+-- independent and all state lives on disk under CREW_DATA_DIR. No ref/deref,
+-- no in-memory subscriber list.
+--
+-- SSE / streaming note (ILO-379 chunked transfer):
+--   `ilo httpd` supports a chunked body when the response `body` is an `L t`
+--   (each element is one chunk). BUT it materialises the whole list before
+--   writing the first byte (src/main.rs handle_http_connection: the List arm
+--   does items.iter().map(to_string).collect() up front). So a handler cannot
+--   drive a long-lived tail that emits lines as they are appended.
+--   /events/stream therefore returns a one-shot SSE *snapshot* of today's
+--   feed, correctly chunk-framed, then closes. A true file-tailing stream
+--   that holds the connection open needs a lazy/iterator response body.
+--   -- TODO(crew): streaming response shape - needs httpd to accept a lazy
+--   -- `L t` (or a pull callback) so the handler can tail data/feed/<day>.jsonl
+--   -- without buffering. Tracked as an ilo gap (see ilo_assessment_feedback.md).
 
-use types
-use store
+-- NOTE: this file is intentionally self-contained. `ilo httpd` parses and
+-- verifies only the single handler file and does NOT resolve `use` imports
+-- (httpd_cmd in ilo's src/main.rs skips resolve_imports, unlike `ilo run` /
+-- `ilo check`). So the type + jsonl-store logic that also lives in the
+-- modular types.ilo / store_jsonl.ilo is inlined here. The modular files
+-- remain the verified library used by `ilo check` and the `ilo run`-based
+-- tooling (digest.ilo); keep the two in sync until httpd learns imports.
+-- Tracked as an ilo gap (see ilo_assessment_feedback.md).
 
--- ---------- handlers ----------
+type event{evid:t;ts:n;machine:t;agent:t;kind:t;target:t;note:t}
+type memory{slug:t;body:t;updated:n}
+type claim{target:t;holder:t;ts:n}
+type artifact{target:t;kind:t;link:t;ts:n;machine:t;agent:t}
 
-post_event store:Store body:M t t>R t t;
-  e=~Event
-    evid:(mget body "evid" (gen-uuid))
-    ts:(mget body "ts" (now-ms))
-    machine:(mget body "machine" "?")
-    agent:(mget body "agent" "?")
-    kind:(mget body "kind" "update")
-    target:(mget body "target" "")
-    note:(mget body "note" "")
-    meta:(mget body "meta" mmap);
-  ?store.feed_append(e)
-    {^er:^er
-     ~_:broadcast_sse "event" (jdmp e);
-     jdmp e}
+type rsp{status:n;body:t}
+type rspc{status:n;body:L t}
 
-get_events store:Store qs:M t t>t;
-  since=num (mget qs "since" "0");
-  events=store.feed_since(since);
-  jdmp events
+-- ========== inlined jsonl store ==========
 
-get_memory store:Store slug:t>R t t;
-  ?store.memory_get(slug)
-    {^er:^er
-     ~m:jdmp m}
+empty-event>event;
+  event evid:"" ts:0 machine:"" agent:"" kind:"" target:"" note:""
 
-put_memory store:Store slug:t body:t>R t t;
-  ?store.memory_put(slug body)
-    {^er:^er
-     ~m:broadcast_sse "memory" (jdmp m);
-     jdmp m}
+empty-claim>claim;
+  claim target:"" holder:"" ts:0
 
-del_memory store:Store slug:t>R t t;
-  ?store.memory_del(slug)
-    {^er:^er
-     ~_:broadcast_sse "memory_del" slug;
-     "{}"}
+empty-artifact>artifact;
+  artifact target:"" kind:"" link:"" ts:0 machine:"" agent:""
 
-list_memory store:Store>t;
-  jdmp store.memory_list()
+parse-event s:t>event;
+  default-on-err (jpar s) (empty-event())
 
-try_claim store:Store target:t body:M t t>R t t;
-  holder=mget body "holder" "?";
-  ?store.claim_try(target holder)
-    {^er:^er
-     ~c:broadcast_sse "claim" (jdmp c);
-     jdmp c}
+parse-claim s:t>claim;
+  default-on-err (jpar s) (empty-claim())
 
-free_claim store:Store target:t body:M t t>R t t;
-  holder=mget body "holder" "?";
-  ?store.claim_free(target holder)
-    {^er:^er
-     ~_:broadcast_sse "claim_free" target;
-     "{}"}
+parse-artifact s:t>artifact;
+  default-on-err (jpar s) (empty-artifact())
 
-list_claims store:Store>t;
-  jdmp store.claim_list()
+data-dir>t;
+  default-on-err (env "CREW_DATA_DIR") "./data"
 
-add_artifact store:Store body:M t t>R t t;
-  ?store.artifact_add(
-    mget body "target" ""
-    mget body "kind" "research"
-    mget body "link" ""
-    mget body "machine" "?"
-    mget body "agent" "?")
-    {^er:^er
-     ~a:broadcast_sse "artifact" (jdmp a);
-     jdmp a}
+-- timestamps are stored as unix ms; dtfmt wants seconds.
+day-of ts:n>t;
+  default-on-err (dtfmt (/ts 1000) "%Y-%m-%d") "1970-01-01"
 
-list_artifacts store:Store target:t>t;
-  jdmp store.artifact_list(target)
+slugify s:t>t;
+  rgxsub "[^a-zA-Z0-9_-]" "_" s
 
--- ---------- SSE broadcast ----------
--- Subscribers register a callback; broadcast iterates and fires.
--- Replaced by a proper event-source channel once ilo has one.
+feed-path dir:t ts:n>t;
+  fn1=+(day-of ts)".jsonl"
+  pathjoin [dir "feed" fn1]
 
-sse_subs=ref []   -- list of (subscriber-id, write-fn)
+memory-path dir:t slug:t>t;
+  fn1=+slug".md"
+  pathjoin [dir "memory" fn1]
 
-broadcast_sse kind:t payload:t>_;
-  msg=fmt "event: {}\ndata: {}\n\n" kind payload;
-  @sub (deref sse_subs){
-    (sid wfn)=sub;
-    wfn msg
-  }
+claim-path dir:t target:t>t;
+  fn1=+(slugify target)".json"
+  pathjoin [dir "claims" fn1]
 
--- ---------- routing ----------
+artifact-path dir:t target:t>t;
+  fn1=+(slugify target)".jsonl"
+  pathjoin [dir "artifacts" fn1]
 
-handle req:Request>Response;
-  cfg=load_cfg;
-  store=make_store cfg | unwrap;
-  m=req.method;
-  p=req.path;
-  if (and (= m "POST") (= p "/events"))      {ret resp_json (post_event store (jpar req.body))};
-  if (and (= m "GET")  (= p "/events"))      {ret resp_json (get_events store req.query)};
-  if (and (= m "GET")  (= p "/events/stream")){ret sse_stream req};
-  if (and (= m "GET")  (= p "/memory"))      {ret resp_json (list_memory store)};
-  if (and (= m "GET")  (head p "/memory/")) {ret resp_json (get_memory store (drop-prefix p "/memory/"))};
-  if (and (= m "PUT")  (head p "/memory/")) {ret resp_json (put_memory store (drop-prefix p "/memory/") req.body)};
-  if (and (= m "DELETE") (head p "/memory/")){ret resp_json (del_memory store (drop-prefix p "/memory/"))};
-  if (and (= m "POST") (head p "/claims/")) {ret resp_json (try_claim store (drop-prefix p "/claims/") (jpar req.body))};
-  if (and (= m "DELETE") (head p "/claims/")){ret resp_json (free_claim store (drop-prefix p "/claims/") (jpar req.body))};
-  if (and (= m "GET")  (= p "/claims"))      {ret resp_json (list_claims store)};
-  if (and (= m "POST") (= p "/artifacts"))   {ret resp_json (add_artifact store (jpar req.body))};
-  if (and (= m "GET")  (= p "/artifacts"))   {ret resp_json (list_artifacts store (mget req.query "target" ""))};
-  if (= p "/healthz") {ret resp_text "ok"};
-  resp_404
+-- ilo has no native mkdir; shell out once. run only Errs on spawn failure.
+ensure-dirs dir:t>t;
+  default-on-err (run "mkdir" ["-p" pathjoin [dir "feed"]]) (mmap)
+  default-on-err (run "mkdir" ["-p" pathjoin [dir "memory"]]) (mmap)
+  default-on-err (run "mkdir" ["-p" pathjoin [dir "claims"]]) (mmap)
+  default-on-err (run "mkdir" ["-p" pathjoin [dir "artifacts"]]) (mmap)
+  dir
 
--- ---------- entry ----------
+jsonl-feed-append ev:event>R event t;
+  dir=ensure-dirs (data-dir())
+  fp=feed-path dir ev.ts
+  line=+(jdmp ev)"\n"
+  wra fp line
+  ~ev
 
-main argv:L t>_;
-  port=num (env "CREW_PORT" "7777");
-  prnt (fmt "crew-server listening on :{}" port);
-  http-listen port handle
+jsonl-feed-since since:n>L event;
+  dir=data-dir()
+  paths=[feed-path dir (now-ms) feed-path dir -(now-ms)86400000]
+  lines=flatmap (p:t>L t;?h (isfile p) (default-on-err (rdl p) []) []) paths
+  events=map (ln:t>event;parse-event ln) lines
+  flt (ev:event>b;>ev.ts since) events
+
+jsonl-feed-today-lines>L t;
+  fp=feed-path (data-dir()) (now-ms)
+  ?h (isfile fp) (default-on-err (rdl fp) []) []
+
+jsonl-memory-get slug:t>R memory t;
+  fp=memory-path (data-dir()) slug
+  =(isfile fp) false ^+"slug not found: "slug
+  body=rd! fp
+  upd=default-on-err (mtime fp) 0
+  ~memory slug:slug body:body updated:upd
+
+jsonl-memory-put slug:t body:t>R memory t;
+  dir=ensure-dirs (data-dir())
+  fp=memory-path dir slug
+  wr fp body
+  ~memory slug:slug body:body updated:(now-ms)
+
+jsonl-memory-del slug:t>R t t;
+  fp=memory-path (data-dir()) slug
+  (isfile fp){default-on-err (run "rm" [fp]) (mmap)}
+  ~slug
+
+jsonl-memory-list>L t;
+  files=default-on-err (glob (pathjoin [data-dir() "memory"]) "*.md") []
+  map (p:t>t;rgxsub "\\.md$" "" (basename p)) files
+
+held-result held:claim hldr:t>R claim t;
+  =held.holder hldr ~held
+  ^+"already claimed by "held.holder
+
+jsonl-claim-try target:t holder:t>R claim t;
+  dir=ensure-dirs (data-dir())
+  fp=claim-path dir target
+  (isfile fp){ret held-result (parse-claim (rd! fp)) holder}
+  c=claim target:target holder:holder ts:(now-ms)
+  wr fp (jdmp c)
+  ~c
+
+free-if-owner held:claim hldr:t fp:t target:t>R t t;
+  =held.holder hldr {default-on-err (run "rm" [fp]) (mmap);ret ~target}
+  ^+"claim held by "held.holder
+
+jsonl-claim-free target:t holder:t>R t t;
+  fp=claim-path (data-dir()) target
+  =(isfile fp) false ~target
+  free-if-owner (parse-claim (rd! fp)) holder fp target
+
+-- glob returns names relative to its dir arg, so rejoin before reading.
+read-claim-file cdir:t name:t>claim;
+  fp=pathjoin [cdir name]
+  parse-claim (default-on-err (rd fp) "{}")
+
+jsonl-claim-list>L claim;
+  cdir=pathjoin [data-dir() "claims"]
+  names=default-on-err (glob cdir "*.json") []
+  map (n:t>claim;read-claim-file cdir n) names
+
+jsonl-artifact-add target:t kind:t link:t machine:t agent:t>R artifact t;
+  dir=ensure-dirs (data-dir())
+  a=artifact target:target kind:kind link:link ts:(now-ms) machine:machine agent:agent
+  fp=artifact-path dir target
+  line=+(jdmp a)"\n"
+  wra fp line
+  ~a
+
+jsonl-artifact-list target:t>L artifact;
+  fp=artifact-path (data-dir()) target
+  =(isfile fp) false []
+  lines=default-on-err (rdl fp) []
+  map (ln:t>artifact;parse-artifact ln) lines
+
+-- ========== http layer ==========
+
+-- ---------- routing helpers ----------
+
+starts-with s:t pre:t>b;
+  = (slc s 0 (len pre)) pre
+
+after-prefix s:t pre:t>t;
+  slc s (len pre) -1
+
+-- query string value for `key` in a path like "/events?since=10".
+query-val path:t key:t>t;
+  parts=spl path "?"
+  =(len parts) 2 (query-lookup (at parts 1) key)
+  ""
+
+-- scan key=value pairs by recursion over the split list.
+query-lookup qs:t key:t>t;
+  pairs=spl qs "&"
+  scan-pairs pairs key 0
+
+scan-pairs pairs:L t key:t i:n>t;
+  >=i (len pairs) ""
+  kp=spl (at pairs i) "="
+  match-here kp key pairs key i
+
+match-here kp:L t k:t pairs:L t key:t i:n>t;
+  & (=(len kp) 2) (=(at kp 0) k) (at kp 1)
+  scan-pairs pairs key +i 1
+
+-- ---------- body field extraction ----------
+
+field body:t key:t fallback:t>t;
+  default-on-err (jpth body key) fallback
+
+field-n body:t key:t fallback:n>n;
+  default-on-err (num (default-on-err (jpth body key) (str fallback))) fallback
+
+-- ---------- response builders ----------
+
+ok-json s:t>rsp;
+  rsp status:200 body:s
+
+err-json msg:t>rsp;
+  body=fmt "{{\"error\":{}}}" (jdmp msg)
+  rsp status:409 body:body
+
+text-rsp s:t>rsp;
+  rsp status:200 body:s
+
+not-found>rsp;
+  rsp status:404 body:"{\"error\":\"not found\"}"
+
+-- ---------- event endpoints ----------
+
+post-event body:t>rsp;
+  ev=event evid:(field body "evid" (b64u (rand-bytes 16))) ts:(field-n body "ts" (now-ms)) machine:(field body "machine" "?") agent:(field body "agent" "?") kind:(field body "kind" "update") target:(field body "target" "") note:(field body "note" "")
+  r=jsonl-feed-append ev
+  ?r{~v:ok-json (jdmp v);^er:err-json er}
+
+get-events path:t>rsp;
+  since=default-on-err (num (query-val path "since")) 0
+  ok-json (jdmp (jsonl-feed-since since))
+
+-- one-shot SSE snapshot of today's feed (see streaming note at top of file).
+-- Built by recursion (no lambda, see note in query-lookup).
+stream-events>rspc;
+  lines=jsonl-feed-today-lines()
+  rspc status:200 body:(frame-lines lines 0 [])
+
+frame-lines lines:L t i:n acc:L t>L t;
+  >=i (len lines) acc
+  frame=sse-frame (at lines i)
+  nxt=+=acc frame
+  frame-lines lines +i 1 nxt
+
+sse-frame data:t>t;
+  fmt "event: feed\ndata: {}\n\n" data
+
+-- ---------- memory endpoints ----------
+
+get-memory slug:t>rsp;
+  r=jsonl-memory-get slug
+  ?r{~v:ok-json (jdmp v);^er:not-found()}
+
+put-memory slug:t body:t>rsp;
+  r=jsonl-memory-put slug body
+  ?r{~v:ok-json (jdmp v);^er:err-json er}
+
+del-memory slug:t>rsp;
+  r=jsonl-memory-del slug
+  ?r{~v:ok-json "{}";^er:err-json er}
+
+list-memory>rsp;
+  ok-json (jdmp (jsonl-memory-list()))
+
+-- ---------- claim endpoints ----------
+
+try-claim target:t body:t>rsp;
+  holder=field body "holder" "?"
+  r=jsonl-claim-try target holder
+  ?r{~v:ok-json (jdmp v);^er:err-json er}
+
+free-claim target:t body:t>rsp;
+  holder=field body "holder" "?"
+  r=jsonl-claim-free target holder
+  ?r{~v:ok-json "{}";^er:err-json er}
+
+list-claims>rsp;
+  ok-json (jdmp (jsonl-claim-list()))
+
+-- ---------- artifact endpoints ----------
+
+add-artifact body:t>rsp;
+  r=jsonl-artifact-add (field body "target" "") (field body "kind" "research") (field body "link" "") (field body "machine" "?") (field body "agent" "?")
+  ?r{~v:ok-json (jdmp v);^er:err-json er}
+
+list-artifacts path:t>rsp;
+  ok-json (jdmp (jsonl-artifact-list (query-val path "target")))
+
+-- ---------- path dispatch ----------
+-- Two dispatch fns: one for routes returning the chunked `rspc` type, one
+-- for everything returning `rsp`. The top-level handler returns `_` so it
+-- can yield either record type depending on the route.
+
+route-rsp m:t p:t body:t>rsp;
+  & (=m "POST") (path-eq p "/events") (post-event body)
+  & (=m "GET") (path-base-eq p "/events") (get-events p)
+  & (=m "GET") (=p "/memory") (list-memory())
+  & (=m "GET") (starts-with p "/memory/") (get-memory (after-prefix p "/memory/"))
+  & (=m "PUT") (starts-with p "/memory/") (put-memory (after-prefix p "/memory/") body)
+  & (=m "DELETE") (starts-with p "/memory/") (del-memory (after-prefix p "/memory/"))
+  & (=m "GET") (=p "/claims") (list-claims())
+  & (=m "POST") (starts-with p "/claims/") (try-claim (after-prefix p "/claims/") body)
+  & (=m "DELETE") (starts-with p "/claims/") (free-claim (after-prefix p "/claims/") body)
+  & (=m "POST") (path-eq p "/artifacts") (add-artifact body)
+  & (=m "GET") (path-base-eq p "/artifacts") (list-artifacts p)
+  & (=m "GET") (=p "/healthz") (text-rsp "ok")
+  not-found()
+
+-- path equality ignoring any query string.
+path-base p:t>t;
+  at (spl p "?") 0
+
+path-eq p:t want:t>b;
+  =(path-base p) want
+
+path-base-eq p:t want:t>b;
+  =(path-base p) want
+
+-- ---------- handler ----------
+
+handler req:_>_;
+  m=req.method
+  p=req.path
+  is-stream=& (=m "GET") (path-base-eq p "/events/stream")
+  is-stream {ret stream-events()}
+  route-rsp m p req.body
