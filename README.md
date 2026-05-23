@@ -57,7 +57,11 @@ crew is coordination infrastructure for AI agents. ilo is the programming langua
 
 ## Status
 
-v0. Scaffold + JSONL adapter + MCP stdio sketch. Not yet wired end-to-end. See [docs/architecture.md](docs/architecture.md) for the design, and [src/](src/) for what's built.
+v0. Scaffold + JSONL adapter + handler shapes laid out. Not yet wired end-to-end.
+
+**Blocked on [ILO-46](https://linear.app/ilo-lang/issue/ILO-46)** (HTTP server + streaming in ilo). See [docs/blockers.md](docs/blockers.md). Once ILO-46 lands the scaffold compiles as-written. Until then, a small Bun shim in [`shim/`](shim/) (TBD) bridges HTTP to ilo handlers so we can dogfood the design.
+
+See [docs/architecture.md](docs/architecture.md) for the design, and [src/](src/) for what's built.
 
 ## License
 
