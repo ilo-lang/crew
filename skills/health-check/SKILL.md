@@ -80,6 +80,8 @@ c. **Of what remains, prefer:**
 - Diagnostic / docs / parser-hint scope over runtime bug-hunts.
 - Non-overlapping codebase areas vs the currently-running agent (parser vs lexer vs verifier vs registry) to minimise merge friction.
 
+**Diagnostic-code allocation.** If the ticket will introduce a new `ILO-PXXX` / `ILO-TXXX` / `ILO-WXXX` / `ILO-RXXX` code, find the next free integer by looking at **both** the latest `main` *and* every open PR's diff against `main`. Two subagents in parallel can otherwise claim the same code (observed: ILO-460 and ILO-473 both reached for `ILO-P023`, requiring a renumber on the second PR). Tell the subagent the specific reserved-up-to integer in its prompt so it picks the next-free, e.g. "the next free parse code is `ILO-P024` — `ILO-P023` is taken by open PR #773; use `ILO-P024` or later."
+
 d. **Claim and launch.** For each chosen ticket:
 
 ```graphql
