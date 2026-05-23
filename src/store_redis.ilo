@@ -1,0 +1,15 @@
+-- Redis-backed Store adapter. Stub for v1.
+--
+-- Blocker: ilo has no RESP/TCP client today. Implementing this is the
+-- first big "ilo can't" entry to log in ilo_assessment_feedback.md
+-- when we get to it. Two paths forward:
+--   1. Add a RESP client builtin / package to ilo (manifesto-loop way)
+--   2. Shell out to redis-cli via run (works, not idiomatic)
+--
+-- Until either lands, this adapter errors loudly.
+
+use types
+use store
+
+make_store_redis cfg:M t t>R Store t;
+  ^"redis adapter blocked — ilo has no RESP client. See store_redis.ilo."

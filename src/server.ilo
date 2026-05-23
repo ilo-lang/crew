@@ -1,0 +1,129 @@
+-- crew server: single-writer authority for the durable store.
+--
+-- Responsibilities:
+--   - REST endpoints (see docs/architecture.md)
+--   - SSE broadcast on /events/stream so per-machine agents stay live
+--   - Claim acquisition is the only synchronous-must-succeed path
+--   - Everything else is post-and-return; clients read back via SSE
+--
+-- v1 status: scaffold. Routes laid out, handlers delegate to Store.
+-- HTTP server primitive is the open question — ilo's http-listen surface
+-- is the next thing to confirm. See ilo_assessment_feedback.md.
+
+use types
+use store
+
+-- ---------- handlers ----------
+
+post_event store:Store body:M t t>R t t;
+  e=~Event
+    evid:(mget body "evid" (gen-uuid))
+    ts:(mget body "ts" (now-ms))
+    machine:(mget body "machine" "?")
+    agent:(mget body "agent" "?")
+    kind:(mget body "kind" "update")
+    target:(mget body "target" "")
+    note:(mget body "note" "")
+    meta:(mget body "meta" mmap);
+  ?store.feed_append(e)
+    {^er:^er
+     ~_:broadcast_sse "event" (jdmp e);
+     jdmp e}
+
+get_events store:Store qs:M t t>t;
+  since=num (mget qs "since" "0");
+  events=store.feed_since(since);
+  jdmp events
+
+get_memory store:Store slug:t>R t t;
+  ?store.memory_get(slug)
+    {^er:^er
+     ~m:jdmp m}
+
+put_memory store:Store slug:t body:t>R t t;
+  ?store.memory_put(slug body)
+    {^er:^er
+     ~m:broadcast_sse "memory" (jdmp m);
+     jdmp m}
+
+del_memory store:Store slug:t>R t t;
+  ?store.memory_del(slug)
+    {^er:^er
+     ~_:broadcast_sse "memory_del" slug;
+     "{}"}
+
+list_memory store:Store>t;
+  jdmp store.memory_list()
+
+try_claim store:Store target:t body:M t t>R t t;
+  holder=mget body "holder" "?";
+  ?store.claim_try(target holder)
+    {^er:^er
+     ~c:broadcast_sse "claim" (jdmp c);
+     jdmp c}
+
+free_claim store:Store target:t body:M t t>R t t;
+  holder=mget body "holder" "?";
+  ?store.claim_free(target holder)
+    {^er:^er
+     ~_:broadcast_sse "claim_free" target;
+     "{}"}
+
+list_claims store:Store>t;
+  jdmp store.claim_list()
+
+add_artifact store:Store body:M t t>R t t;
+  ?store.artifact_add(
+    mget body "target" ""
+    mget body "kind" "research"
+    mget body "link" ""
+    mget body "machine" "?"
+    mget body "agent" "?")
+    {^er:^er
+     ~a:broadcast_sse "artifact" (jdmp a);
+     jdmp a}
+
+list_artifacts store:Store target:t>t;
+  jdmp store.artifact_list(target)
+
+-- ---------- SSE broadcast ----------
+-- Subscribers register a callback; broadcast iterates and fires.
+-- Replaced by a proper event-source channel once ilo has one.
+
+sse_subs=ref []   -- list of (subscriber-id, write-fn)
+
+broadcast_sse kind:t payload:t>_;
+  msg=fmt "event: {}\ndata: {}\n\n" kind payload;
+  @sub (deref sse_subs){
+    (sid wfn)=sub;
+    wfn msg
+  }
+
+-- ---------- routing ----------
+
+handle req:Request>Response;
+  cfg=load_cfg;
+  store=make_store cfg | unwrap;
+  m=req.method;
+  p=req.path;
+  if (and (= m "POST") (= p "/events"))      {ret resp_json (post_event store (jpar req.body))};
+  if (and (= m "GET")  (= p "/events"))      {ret resp_json (get_events store req.query)};
+  if (and (= m "GET")  (= p "/events/stream")){ret sse_stream req};
+  if (and (= m "GET")  (= p "/memory"))      {ret resp_json (list_memory store)};
+  if (and (= m "GET")  (head p "/memory/")) {ret resp_json (get_memory store (drop-prefix p "/memory/"))};
+  if (and (= m "PUT")  (head p "/memory/")) {ret resp_json (put_memory store (drop-prefix p "/memory/") req.body)};
+  if (and (= m "DELETE") (head p "/memory/")){ret resp_json (del_memory store (drop-prefix p "/memory/"))};
+  if (and (= m "POST") (head p "/claims/")) {ret resp_json (try_claim store (drop-prefix p "/claims/") (jpar req.body))};
+  if (and (= m "DELETE") (head p "/claims/")){ret resp_json (free_claim store (drop-prefix p "/claims/") (jpar req.body))};
+  if (and (= m "GET")  (= p "/claims"))      {ret resp_json (list_claims store)};
+  if (and (= m "POST") (= p "/artifacts"))   {ret resp_json (add_artifact store (jpar req.body))};
+  if (and (= m "GET")  (= p "/artifacts"))   {ret resp_json (list_artifacts store (mget req.query "target" ""))};
+  if (= p "/healthz") {ret resp_text "ok"};
+  resp_404
+
+-- ---------- entry ----------
+
+main argv:L t>_;
+  port=num (env "CREW_PORT" "7777");
+  prnt (fmt "crew-server listening on :{}" port);
+  http-listen port handle

@@ -1,0 +1,14 @@
+-- SQLite-backed Store adapter. Stub for v1 — wired into the contract
+-- but the body shells out to sqlite3 (no native ilo SQLite bindings yet).
+--
+-- Schema (see scripts/sqlite/schema.sql when implemented):
+--   events     (evid TEXT PRIMARY KEY, ts INTEGER, machine, agent, kind, target, note, meta)
+--   memory     (slug TEXT PRIMARY KEY, body TEXT, updated INTEGER)
+--   claims     (target TEXT PRIMARY KEY, holder TEXT, ts INTEGER)
+--   artifacts  (rowid INTEGER PK, target, kind, link, ts, machine, agent)
+
+use types
+use store
+
+make_store_sqlite cfg:M t t>R Store t;
+  ^"sqlite adapter not implemented yet — use CREW_STORE=jsonl for v1"

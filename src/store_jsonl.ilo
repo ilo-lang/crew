@@ -1,0 +1,124 @@
+-- JSONL/file-backed Store adapter. Default backend.
+--
+-- Layout under data/:
+--   feed/YYYY-MM-DD.jsonl    one line per event, append-only
+--   memory/<slug>.md          last-writer-wins per slug
+--   claims/<target>.json      one file per active claim (presence = held)
+--   artifacts/<target>.jsonl  append-only per target
+--
+-- Only the server runs this. Single writer per process. No flock needed.
+
+use types
+use store
+
+-- ---------- helpers ----------
+
+feed_path dir:t ts:n>t;
+  day=dtfmt ts "%Y-%m-%d";
+  pathjoin dir (+ "feed/" + day ".jsonl")
+
+memory_path dir:t slug:t>t;
+  pathjoin dir (+ "memory/" + slug ".md")
+
+claim_path dir:t target:t>t;
+  pathjoin dir (+ "claims/" + (slugify target) ".json")
+
+artifact_path dir:t target:t>t;
+  pathjoin dir (+ "artifacts/" + (slugify target) ".jsonl")
+
+slugify s:t>t;
+  -- replace anything that isn't [a-zA-Z0-9_-] with "_"
+  rgx-replace s "[^a-zA-Z0-9_-]" "_"
+
+-- ---------- handlers ----------
+
+jsonl_feed_append dir:t e:Event>R _ t;
+  fp=feed_path dir e.ts;
+  line=+ (jdmp e) "\n";
+  wr-append fp line
+
+jsonl_feed_since dir:t since:n>L Event;
+  -- naive v0: scan today's + yesterday's files, filter by ts.
+  -- TODO(perf): once we have heavy reads, index by day.
+  today=dtfmt (now-ms) "%Y-%m-%d";
+  yday=dtfmt (- (now-ms) 86400000) "%Y-%m-%d";
+  paths=[pathjoin dir (+ "feed/" yday ".jsonl") pathjoin dir (+ "feed/" today ".jsonl")];
+  lines=flatmap (p:t>L t;if (isfile p) {rdjl p} else {[]}) paths;
+  events=map jpar lines;
+  flt (e:Event>bool;> e.ts since) events
+
+jsonl_memory_get dir:t slug:t>R Memory t;
+  fp=memory_path dir slug;
+  if (! isfile fp) {^+"slug not found: " slug};
+  body=rd fp;
+  upd=mtime fp;
+  ~slug:slug body:body updated:upd
+
+jsonl_memory_put dir:t slug:t body:t>R Memory t;
+  fp=memory_path dir slug;
+  wr fp body;
+  ~slug:slug body:body updated:(now-ms)
+
+jsonl_memory_del dir:t slug:t>R _ t;
+  fp=memory_path dir slug;
+  if (isfile fp) {rm fp};
+  ~_
+
+jsonl_memory_list dir:t>L t;
+  glob (pathjoin dir "memory/*.md") | map basename | map (s:t>t;rgx-replace s "\\.md$" "")
+
+jsonl_claim_try dir:t target:t holder:t>R Claim t;
+  fp=claim_path dir target;
+  if (isfile fp) {
+    existing=jpar (rd fp);
+    if (= existing.holder holder) {ret ~existing};
+    ^+"already claimed by " existing.holder
+  };
+  c=~target:target holder:holder ts:(now-ms);
+  wr fp (jdmp c);
+  ~c
+
+jsonl_claim_free dir:t target:t holder:t>R _ t;
+  fp=claim_path dir target;
+  if (! isfile fp) {ret ~_};
+  existing=jpar (rd fp);
+  if (! = existing.holder holder) {^+"claim held by " existing.holder};
+  rm fp;
+  ~_
+
+jsonl_claim_list dir:t>L Claim;
+  paths=glob (pathjoin dir "claims/*.json");
+  map (p:t>Claim;jpar (rd p)) paths
+
+jsonl_artifact_add dir:t target:t kind:t link:t machine:t agent:t>R Artifact t;
+  a=~target:target kind:kind link:link ts:(now-ms) machine:machine agent:agent;
+  fp=artifact_path dir target;
+  wr-append fp (+ (jdmp a) "\n");
+  ~a
+
+jsonl_artifact_list dir:t target:t>L Artifact;
+  fp=artifact_path dir target;
+  if (! isfile fp) {ret []};
+  map jpar (rdjl fp)
+
+-- ---------- constructor ----------
+
+make_store_jsonl cfg:M t t>R Store t;
+  dir=mget cfg "data_dir" "./data";
+  -- ensure dirs exist
+  mkdir-p (pathjoin dir "feed");
+  mkdir-p (pathjoin dir "memory");
+  mkdir-p (pathjoin dir "claims");
+  mkdir-p (pathjoin dir "artifacts");
+  ~Store
+    feed_append:(e:Event>R _ t;jsonl_feed_append dir e)
+    feed_since:(s:n>L Event;jsonl_feed_since dir s)
+    memory_get:(g:t>R Memory t;jsonl_memory_get dir g)
+    memory_put:(s:t b:t>R Memory t;jsonl_memory_put dir s b)
+    memory_del:(s:t>R _ t;jsonl_memory_del dir s)
+    memory_list:(>L t;jsonl_memory_list dir)
+    claim_try:(tg:t h:t>R Claim t;jsonl_claim_try dir tg h)
+    claim_free:(tg:t h:t>R _ t;jsonl_claim_free dir tg h)
+    claim_list:(>L Claim;jsonl_claim_list dir)
+    artifact_add:(tg:t k:t l:t m:t a:t>R Artifact t;jsonl_artifact_add dir tg k l m a)
+    artifact_list:(tg:t>L Artifact;jsonl_artifact_list dir tg)

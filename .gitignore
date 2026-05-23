@@ -1,0 +1,7 @@
+data/
+.crew/
+*.log
+.env
+.env.local
+target/
+.DS_Store

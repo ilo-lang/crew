@@ -1,0 +1,36 @@
+-- crew Store adapter contract.
+--
+-- Each backend (jsonl, sqlite, redis) exports a make_store(cfg) function
+-- returning a Store record with these handlers. The server selects one
+-- at startup via CREW_STORE env.
+
+use types
+
+type Store = {
+  -- feed
+  feed_append: (Event) -> R _ t,
+  feed_since:  (n) -> L Event,
+
+  -- memory
+  memory_get:  (t) -> R Memory t,
+  memory_put:  (t, t) -> R Memory t,
+  memory_del:  (t) -> R _ t,
+  memory_list: () -> L t,
+
+  -- claims (authoritative — the server owns these)
+  claim_try:   (t, t) -> R Claim t,   -- target, holder
+  claim_free:  (t, t) -> R _ t,        -- target, holder
+  claim_list:  () -> L Claim,
+
+  -- artifacts
+  artifact_add:  (t, t, t, t, t) -> R Artifact t,   -- target, kind, link, machine, agent
+  artifact_list: (t) -> L Artifact                  -- target
+}
+
+-- Adapter selection. CREW_STORE chooses; default is jsonl.
+make_store cfg:M t t>R Store t;
+  backend=mget cfg "store" "jsonl";
+  if (= backend "jsonl") {ret (make_store_jsonl cfg)};
+  if (= backend "sqlite") {ret (make_store_sqlite cfg)};
+  if (= backend "redis") {ret (make_store_redis cfg)};
+  ^+"unknown CREW_STORE: " backend

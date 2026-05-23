@@ -1,0 +1,15 @@
+-- Digest cron. Runs on the server box on a schedule (DIGEST_CRON env or
+-- driven by systemd-timer). Rsyncs data/ into a separate backup git
+-- repo, commits, pushes.
+--
+-- v1 status: scaffold. Real implementation lands once we have the
+-- backup repo set up + a GitHub App for auth (see docs/architecture.md
+-- "Backup" section).
+
+main argv:L t>_;
+  src=env "DATA_DIR" "./data";
+  backup_repo=env "BACKUP_REPO" "";
+  if (= backup_repo "") {prnt "BACKUP_REPO not set; skipping digest."; ret _};
+  ts=dtfmt (now-ms) "%Y-%m-%dT%H:%M:%SZ";
+  -- TODO: clone if missing, rsync src into clone, git add -A, commit "digest <ts>", push.
+  prnt (fmt "digest stub: would mirror {} to {} at {}" src backup_repo ts)

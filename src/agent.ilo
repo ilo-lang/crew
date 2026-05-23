@@ -1,0 +1,168 @@
+-- crew-agent: one long-lived process per machine.
+--
+-- Roles:
+--   1. MCP HTTP server on 127.0.0.1:7676 — agents (Claude Code, Codex,
+--      Cursor, etc) connect here. Tools: feed_post, feed_recent,
+--      memory_get, memory_put, claim, claim_release, artifact_attach.
+--   2. SSE consumer — subscribes to CREW_SERVER/events/stream and
+--      mirrors incoming events / memory / claims into ~/.crew/.
+--   3. Write-behind queue — buffers writes to ~/.crew/pending.jsonl and
+--      drains to the server. Claim acquisition bypasses the queue and
+--      goes synchronous.
+--
+-- v1 status: scaffold. Handlers laid out; SSE consume + queue drain are
+-- the next things to flesh out once we confirm ilo's HTTP streaming
+-- surface. See ilo_assessment_feedback.md.
+
+use types
+use cache
+
+-- ---------- MCP tool dispatch ----------
+-- MCP exposes tools/list and tools/call. We define the catalogue and
+-- route by name. Each tool maps to a local-cache read or a server write.
+
+tools_catalogue=[
+  ~name:"feed_post" desc:"Post an event to the activity feed."
+  ~name:"feed_recent" desc:"Read recent feed events from the local cache."
+  ~name:"memory_get" desc:"Read a memory slug from the local cache."
+  ~name:"memory_put" desc:"Write a memory slug. Write-behind."
+  ~name:"memory_list" desc:"List all memory slugs in the local cache."
+  ~name:"claim" desc:"Acquire a claim on a target. Synchronous to server."
+  ~name:"claim_release" desc:"Release a claim. Write-behind."
+  ~name:"artifact_attach" desc:"Attach a research/repro/benchmark artifact to a target."
+]
+
+dispatch name:t args:M t t>R t t;
+  if (= name "feed_post")       {ret tool_feed_post args};
+  if (= name "feed_recent")     {ret tool_feed_recent args};
+  if (= name "memory_get")      {ret tool_memory_get args};
+  if (= name "memory_put")      {ret tool_memory_put args};
+  if (= name "memory_list")     {ret tool_memory_list args};
+  if (= name "claim")           {ret tool_claim args};
+  if (= name "claim_release")   {ret tool_claim_release args};
+  if (= name "artifact_attach") {ret tool_artifact_attach args};
+  ^+"unknown tool: " name
+
+-- ---------- tool handlers ----------
+
+tool_feed_post args:M t t>R t t;
+  e=~Event
+    evid:(gen-uuid)
+    ts:(now-ms)
+    machine:(machine_name)
+    agent:(mget args "agent" "?")
+    kind:(mget args "kind" "update")
+    target:(mget args "target" "")
+    note:(mget args "note" "")
+    meta:(mget-map args "meta" mmap);
+  cache_feed_append e;
+  enqueue_write "POST" "/events" (jdmp e);
+  ~jdmp e
+
+tool_feed_recent args:M t t>R t t;
+  since=num (mget args "since" (str (- (now-ms) 86400000)));
+  ~jdmp (cache_feed_since since)
+
+tool_memory_get args:M t t>R t t;
+  slug=mget args "slug" "";
+  ?cache_memory_get slug {^er:^er ~m:~jdmp m}
+
+tool_memory_put args:M t t>R t t;
+  slug=mget args "slug" "";
+  body=mget args "body" "";
+  m=cache_memory_put slug body;
+  enqueue_write "PUT" (+ "/memory/" slug) body;
+  ~jdmp m
+
+tool_memory_list _:M t t>R t t;
+  ~jdmp (cache_memory_list)
+
+tool_claim args:M t t>R t t;
+  -- write-through: synchronous to server, authoritative answer.
+  target=mget args "target" "";
+  holder=+ (machine_name) ":" (mget args "agent" "?");
+  url=+ (env "CREW_SERVER" "") + "/claims/" target;
+  body=jdmp ~holder:holder;
+  ?pst! url body (auth_headers)
+    {^er:^er
+     ~r:cache_claim_set target holder;
+       ~r}
+
+tool_claim_release args:M t t>R t t;
+  target=mget args "target" "";
+  holder=+ (machine_name) ":" (mget args "agent" "?");
+  cache_claim_clear target;
+  enqueue_write "DELETE" (+ "/claims/" target) (jdmp ~holder:holder);
+  ~"{}"
+
+tool_artifact_attach args:M t t>R t t;
+  body=jdmp ~target:(mget args "target" "")
+                kind:(mget args "kind" "research")
+                link:(mget args "link" "")
+                machine:(machine_name)
+                agent:(mget args "agent" "?");
+  enqueue_write "POST" "/artifacts" body;
+  ~body
+
+-- ---------- write-behind queue ----------
+-- Append to ~/.crew/pending.jsonl. A ticker drains in FIFO order.
+-- On 2xx, the line is dropped. On network error, line stays and ticker
+-- retries with exponential backoff.
+
+enqueue_write method:t path:t body:t>_;
+  line=jdmp ~method:method path:path body:body ts:(now-ms);
+  wr-append (cache_path "pending.jsonl") (+ line "\n")
+
+drain_queue>_;
+  fp=cache_path "pending.jsonl";
+  if (! isfile fp) {ret _};
+  lines=rdjl fp;
+  remaining=[];
+  @line lines {
+    j=jpar line;
+    base=env "CREW_SERVER" "";
+    url=+ base j.path;
+    ok=case j.method
+      "POST"   (pst! url j.body (auth_headers))
+      "PUT"    (put! url j.body (auth_headers))
+      "DELETE" (del! url (auth_headers))
+      _        (^"unknown method");
+    if (is-err ok) {remaining=+ remaining [line]}
+  };
+  wr fp (cat remaining "\n")
+
+-- ---------- SSE consumer ----------
+-- Long-lived GET on /events/stream. Each event updates the local cache
+-- so reads see fresh data without polling.
+
+sse_loop>_;
+  url=+ (env "CREW_SERVER" "") "/events/stream";
+  @evt (sse-stream url (auth_headers)) {
+    case evt.kind
+      "event"      (cache_feed_append (jpar evt.data))
+      "memory"     (let m=jpar evt.data; cache_memory_put m.slug m.body)
+      "memory_del" (cache_memory_del evt.data)
+      "claim"      (let c=jpar evt.data; cache_claim_set c.target c.holder)
+      "claim_free" (cache_claim_clear evt.data)
+      "artifact"   (cache_artifact_append (jpar evt.data))
+      _            _
+  }
+
+-- ---------- helpers ----------
+
+machine_name>t;
+  env "CREW_MACHINE" (hostname)
+
+auth_headers>M t t;
+  mset mmap "Authorization" (+ "Bearer " (env "CREW_TOKEN" ""))
+
+-- ---------- entry ----------
+
+main argv:L t>_;
+  bind=env "CREW_BIND" "127.0.0.1:7676";
+  prnt (fmt "crew-agent listening on {}" bind);
+  -- background loops
+  spawn sse_loop;
+  spawn (>_;wh true {drain_queue; sleep 2});
+  -- MCP HTTP server (foreground)
+  mcp-http-listen bind dispatch tools_catalogue

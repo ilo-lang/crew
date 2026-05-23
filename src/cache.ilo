@@ -1,0 +1,64 @@
+-- ~/.crew local mirror. Owned by crew-agent (single writer on the box).
+--
+-- Layout:
+--   ~/.crew/feed/YYYY-MM-DD.jsonl   server-sent events, append-only
+--   ~/.crew/memory/<slug>.md        last-writer-wins from server
+--   ~/.crew/claims/<target>.json    one file per active claim
+--   ~/.crew/artifacts/<target>.jsonl per-target append-only
+--   ~/.crew/pending.jsonl            write-behind queue
+--   ~/.crew/config.toml              CREW_TOKEN etc
+
+use types
+
+cache_root>t;
+  env "CREW_CACHE" (pathjoin (env "HOME" ".") ".crew")
+
+cache_path sub:t>t;
+  pathjoin (cache_root) sub
+
+ensure_dirs>_;
+  mkdir-p (cache_path "feed");
+  mkdir-p (cache_path "memory");
+  mkdir-p (cache_path "claims");
+  mkdir-p (cache_path "artifacts")
+
+cache_feed_append e:Event>_;
+  fp=cache_path (+ "feed/" + (dtfmt e.ts "%Y-%m-%d") ".jsonl");
+  wr-append fp (+ (jdmp e) "\n")
+
+cache_feed_since since:n>L Event;
+  today=dtfmt (now-ms) "%Y-%m-%d";
+  yday=dtfmt (- (now-ms) 86400000) "%Y-%m-%d";
+  paths=[cache_path (+ "feed/" yday ".jsonl") cache_path (+ "feed/" today ".jsonl")];
+  lines=flatmap (p:t>L t;if (isfile p) {rdjl p} else {[]}) paths;
+  events=map jpar lines;
+  flt (e:Event>bool;> e.ts since) events
+
+cache_memory_get slug:t>R Memory t;
+  fp=cache_path (+ "memory/" + slug ".md");
+  if (! isfile fp) {^+"slug not in local cache: " slug};
+  ~slug:slug body:(rd fp) updated:(mtime fp)
+
+cache_memory_put slug:t body:t>Memory;
+  fp=cache_path (+ "memory/" + slug ".md");
+  wr fp body;
+  ~slug:slug body:body updated:(now-ms)
+
+cache_memory_del slug:t>_;
+  fp=cache_path (+ "memory/" + slug ".md");
+  if (isfile fp) {rm fp}
+
+cache_memory_list>L t;
+  glob (cache_path "memory/*.md") | map basename | map (s:t>t;rgx-replace s "\\.md$" "")
+
+cache_claim_set target:t holder:t>_;
+  fp=cache_path (+ "claims/" + target ".json");
+  wr fp (jdmp ~target:target holder:holder ts:(now-ms))
+
+cache_claim_clear target:t>_;
+  fp=cache_path (+ "claims/" + target ".json");
+  if (isfile fp) {rm fp}
+
+cache_artifact_append a:Artifact>_;
+  fp=cache_path (+ "artifacts/" + a.target ".jsonl");
+  wr-append fp (+ (jdmp a) "\n")
